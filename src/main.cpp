@@ -1,7 +1,4 @@
 #include <Arduino.h>
-#include "hw_config.h"
-#include "display_st7789.h"
-#include "audio_simplex.h"
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <Update.h>
@@ -13,6 +10,8 @@
 #include <math.h>
 #include <memory>
 #include "driver/i2s.h"
+#include "display_st7789.h"
+#include "audio_simplex.h"
 #include "esp_system.h"
 #include "esp_rom_sys.h"
 
@@ -34,22 +33,32 @@ constexpr char kNoDevicePromptPcmUrl[] =
     "/api/hermes/mcu/audio/no-device-24k.s16le.pcm";
 constexpr char kTokenInvalidPromptPcmUrl[] =
     "/api/hermes/mcu/audio/token-invalid-24k.s16le.pcm";
-constexpr int kPinI2cSda = -1;  // No I2C
-constexpr int kPinI2cScl = -1;  // No I2C
-constexpr int kPinI2sDout = 7;  // SPK DOUT
-constexpr int kPinI2sWs = 16;  // SPK WS
-constexpr int kPinI2sDin = 6;  // MIC DIN
-constexpr int kPinI2sBck = 15;  // SPK BCLK
-constexpr int kPinBoot = 0;  // BOOT button
-constexpr int kPinI2sMck = -1;  // No MCLK
-constexpr int kPinPaEn = -1;  // No PA EN
-constexpr int kPinBatteryAdc = 3;
+constexpr int kPinI2cSda = -1;
+constexpr int kPinI2cScl = -1;
+constexpr int kPinI2sDout = 7;
+constexpr int kPinI2sWs = 16;
+constexpr int kPinI2sDin = 6;
+constexpr int kPinI2sBck = 15;
+constexpr int kPinBoot = 0;
+constexpr int kPinVolUp    = 39;
+constexpr int kPinVolDown  = 40;
+
+constexpr int kPinI2sMck = -1;
+constexpr int kPinPaEn = -1;
+constexpr int kPinBatteryAdc = 8;
+constexpr int kPinDisplayMosi = 10;
+constexpr int kPinDisplaySclk = 9;
+constexpr int kPinDisplayCs = 14;
+constexpr int kPinDisplayDc = 8;
+constexpr int kPinDisplayRst = 18;
+constexpr int kPinDisplayBl = 13;
+
 constexpr float kBatteryDividerRatio = 2.0f;
 constexpr uint8_t kEs8311Addr = 0x18;
 constexpr uint8_t kDefaultOledAddr = 0x3C;
 constexpr uint8_t kAltOledAddr = 0x3D;
-constexpr int kOledWidth = 128;
-constexpr int kOledHeight = 64;
+constexpr int kOledWidth = 240;
+constexpr int kOledHeight = 240;
 constexpr uint32_t kOledRefreshIntervalMs = 160;
 constexpr uint32_t kOledSuccessReturnDelayMs = 2500;
 constexpr uint32_t kOledErrorReturnDelayMs = 6000;
@@ -181,8 +190,6 @@ String mcuToolStatus;
 String lastAudioDetail = "not started";
 uint32_t lastAudioAtMs = 0;
 uint8_t oledBuffer[(kOledWidth * kOledHeight) / 8] = {};
-St7789Display* gDisplay = nullptr;
-AudioSimplex* gAudio = nullptr;
 int scannedNetworkCount = 0;
 String scannedSsids[kMaxScannedNetworks];
 int32_t scannedRssi[kMaxScannedNetworks] = {};
@@ -279,11 +286,31 @@ LanDevice lanDevices[kMaxLanDevices];
 int lanDeviceCount = 0;
 
 enum class OledMode : uint8_t {
+  Off,
+  Init,
   Boot,
   Ready,
+  Status,
   Think,
+  Talk,
   Error,
 };
+
+struct OledStatus {
+  OledMode mode = OledMode::Boot;
+  String line1;
+  String line2;
+  uint8_t progress = 0;
+  bool dirty = true;
+};
+
+OledStatus oledStatus;
+
+
+// Global pointers for display and audio
+St7789Display* gDisplay = nullptr;
+AudioSimplex* gAudio = nullptr;
+volatile bool audioReady = false;
 
 OledMode oledMode = OledMode::Boot;
 
@@ -654,43 +681,42 @@ void refreshOled(bool force = false) {
   if (!force && !oledDirty && now - lastOledAtMs < kOledRefreshIntervalMs) return;
   oledDirty = false;
   lastOledAtMs = now;
-  
-  // If we have ST7789 display, use it
-  if (gDisplay) {
+
+  if (!oledReady || !gDisplay) return;
+  if (oledStatus.mode == OledMode::Off) {
     gDisplay->Clear(0x0000);
-    gDisplay->DrawText(2, 2, oledTitle.c_str(), 0xFFFF, 0x0000, 1);
-    
-    if (oledMode == OledMode::Boot) {
-      gDisplay->DrawCenteredText(gDisplay->height() / 2 - 10, oledTitle.c_str(), 0xFFFF, 0x0000, 2);
-      gDisplay->DrawCenteredText(gDisplay->height() / 2 + 8, oledHint.c_str(), 0x7BEF, 0x0000, 1);
-    } else if (oledMode == OledMode::Ready) {
-      gDisplay->DrawCenteredText(gDisplay->height() / 2 - 10, oledTitle.c_str(), 0xFFFF, 0x0000, 2);
-      gDisplay->DrawCenteredText(gDisplay->height() / 2 + 8, oledHint.c_str(), 0x07E0, 0x0000, 1);
-    } else if (oledMode == OledMode::Think) {
-      gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, true, false, 0xFFFF);
-      gDisplay->DrawCenteredText(gDisplay->height() - 16, oledHint.c_str(), 0x7BEF, 0x0000, 1);
-    } else if (oledMode == OledMode::Error) {
-      gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, false, true, 0xF800);
-      gDisplay->DrawCenteredText(gDisplay->height() - 16, oledHint.c_str(), 0xF800, 0x0000, 1);
-    }
-    
-    // Progress bar
-    if (oledProgress > 0 && oledProgress <= 100) {
-      int bw = gDisplay->width() - 40;
-      gDisplay->DrawRect(20, gDisplay->height() - 20, bw, 6, 0xFFFF);
-      int fill = (oledProgress * (bw - 4)) / 100;
-      if (fill > 0) gDisplay->FillRect(22, gDisplay->height() - 18, fill, 2, 0x07E0);
-    }
-    
     gDisplay->Flush();
     return;
   }
-  
-  // Fallback to OLED framebuffer (if no gDisplay)
-  drawOledFrame();
-  oledReady = oledFlush();
-}
 
+  gDisplay->Clear(0x0000);
+
+  switch (oledStatus.mode) {
+    case OledMode::Init:
+      gDisplay->DrawCenteredText(gDisplay->height() / 2 - 12, "Hermes Studio", 0xFFFF, 0x0000, 2);
+      gDisplay->DrawCenteredText(gDisplay->height() / 2 + 8, oledStatus.line2.length() ? oledStatus.line2.c_str() : "starting...", 0x7BEF, 0x0000, 1);
+      break;
+    case OledMode::Status:
+      gDisplay->DrawCenteredText(gDisplay->height() / 2 - 12, oledStatus.line1.c_str(), 0xFFFF, 0x0000, 2);
+      gDisplay->DrawCenteredText(gDisplay->height() / 2 + 8, oledStatus.line2.c_str(), 0x7BEF, 0x0000, 1);
+      break;
+    case OledMode::Think:
+      gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, true, false, 0xFFFF);
+      gDisplay->DrawCenteredText(gDisplay->height() - 16, "thinking...", 0x7BEF, 0x0000, 1);
+      break;
+    case OledMode::Talk:
+      gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, false, false, 0xFFFF);
+      gDisplay->DrawCenteredText(gDisplay->height() - 16, "listening...", 0x7BEF, 0x0000, 1);
+      break;
+    case OledMode::Error:
+      gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, false, true, 0xF800);
+      gDisplay->DrawCenteredText(gDisplay->height() - 16, oledStatus.line1.length() ? oledStatus.line1.c_str() : "Error", 0xF800, 0x0000, 1);
+      break;
+    default:
+      break;
+  }
+  gDisplay->Flush();
+}
 
 void setOledStatus(OledMode mode, const String &title, const String &hint, uint8_t progress = 0) {
   String nextTitle = fitOledText(title, 10);
@@ -726,25 +752,6 @@ void tickOledStatusReturn() {
 }
 
 void initOledDisplay() {
-  // === Try ST7789 SPI LCD first ===
-  gDisplay = new St7789Display(41, 42, 21, 40, 45, 20, 240, 240, 0, 0);
-  if (gDisplay->Init()) {
-    oledReady = true;
-    oledFound = true;
-    Serial.println(F("ST7789 LCD ready - 240x240 RGB565"));
-    gDisplay->Clear(0x0000);
-    gDisplay->DrawCenteredText(100, "Hermes Studio", 0xFFFF, 0x0000, 2);
-    gDisplay->DrawCenteredText(130, "ESP32-S3", 0x7BEF, 0x0000, 2);
-    gDisplay->Flush();
-    setOledStatus(OledMode::Boot, F("BOOT"), F("LCD ONLINE"), 10);
-    return;
-  }
-  // ST7789 failed - cleanup
-  Serial.println(F("ST7789 init FAILED, deleting gDisplay"));
-  delete gDisplay;
-  gDisplay = nullptr;
-
-  // === Fallback: I2C OLED (C3 boards) ===
   Wire.begin(kPinI2cSda, kPinI2cScl);
   Wire.setClock(100000);
   delay(40);
@@ -1468,8 +1475,8 @@ void drainI2sPlayback(uint32_t writtenBytes, uint8_t channels, uint32_t sampleRa
   while (silenceFrames > 0) {
     uint32_t frames = min<uint32_t>(silenceFrames, 128);
     size_t written = 0;
-    int wf_sil = gAudio ? gAudio->Write(reinterpret_cast<const int16_t*>(silence), frames, 1000) : 0;
-    if (wf_sil <= 0) break;
+    esp_err_t err = i2s_write(kI2sPort, silence, frames * frameBytes, &written, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || written == 0) break;
     silenceFrames -= written / frameBytes;
     yield();
   }
@@ -1558,17 +1565,22 @@ bool shouldInterruptAudioForVoice() {
 
 void initAudioHardware() {
   pinMode(kPinBoot, INPUT_PULLUP);
-  setPowerAmp(true);
-  es8311Found = i2cProbe(kEs8311Addr);
-  i2sReady = configureI2sBus();
-  es8311Ready = configureEs8311Codec();
-  if (i2sReady && es8311Ready) {
-    lastAudioDetail = F("audio ready: ES8311 + I2S");
-  } else if (lastAudioDetail.length() == 0) {
-    lastAudioDetail = F("audio init failed");
+  // Use AudioSimplex (I2S TX + I2S RX) matching official NoAudioCodecSimplexPdm
+  if (!gAudio) {
+    gAudio = new AudioSimplex();
   }
-  Serial.printf("Audio init es8311=%d i2s=%d detail=%s\n", es8311Ready ? 1 : 0, i2sReady ? 1 : 0,
-                lastAudioDetail.c_str());
+  // Official luxiaoban pins: SPK BCLK=15, WS=16, DOUT=7; MIC PDM CLK=5, DATA=6
+  bool ok = gAudio->Init(15, 16, 7, 5, 6, 6, kAudioSampleRate);
+  if (ok) {
+    gAudio->SetOutputVolume(kDefaultOutputVolumePercent);
+    audioReady = true;
+    lastAudioDetail = F("audio ready: PDM + I2S");
+    Serial.println(F("AudioSimplex initialized OK"));
+  } else {
+    audioReady = false;
+    lastAudioDetail = F("audio init failed");
+    Serial.println(F("AudioSimplex init FAILED"));
+  }
 }
 
 bool recordVoiceWav(uint8_t **outWav, size_t *outLen) {
@@ -1602,6 +1614,8 @@ bool recordVoiceWav(uint8_t **outWav, size_t *outLen) {
   setOledStatus(OledMode::Think, F("LISTEN"), F("SAY NOW"), 0);
 
   constexpr size_t kReadBytes = 512;
+
+
   uint8_t readBuffer[kReadBytes];
   uint32_t framesDone = 0;
   uint32_t emptyReads = 0;
@@ -2399,7 +2413,7 @@ void sendWifiPage() {
   }
 
   String html = pageStart(F("连接 Wi-Fi"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-S3</p><h1>连接局域网 Wi-Fi</h1>");
+  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>连接局域网 Wi-Fi</h1>");
   if (wifiReady) {
     html += F("<p class='lead ok'>当前已联网：");
     html += escapeHtml(WiFi.SSID());
@@ -2452,7 +2466,7 @@ void sendWifiPage() {
 
 void sendStatusPage() {
   String html = pageStart(F("设备已联网"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-S3</p><h1>设备</h1><p class='lead'>");
+  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>设备</h1><p class='lead'>");
   html += escapeHtml(WiFi.SSID());
   html += F(" · IP ");
   html += WiFi.localIP().toString();
@@ -2584,7 +2598,7 @@ String otaNextCheckText() {
 
 void sendOtaPage(const String &notice = "") {
   String html = pageStart(F("OTA"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-S3</p><h1>OTA</h1><p class='lead'>固件在线升级</p>");
+  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>OTA</h1><p class='lead'>固件在线升级</p>");
   html += F("<nav class='tabs'><a class='tab' href='/device'>设备</a><a class='tab active' href='/ota'>OTA</a></nav>");
   if (notice.length() > 0) {
     html += F("<p class='hint'>");
@@ -2610,7 +2624,7 @@ void sendOtaPage(const String &notice = "") {
 
 void sendOtaUpdatingPage() {
   String html = pageStart(F("OTA"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-S3</p><h1>OTA</h1><p class='lead'>固件正在更新</p>");
+  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>OTA</h1><p class='lead'>固件正在更新</p>");
   html += F("<p class='hint'>固件正在下载并写入，请勿关闭单片机或断开电源。设备会自动重启，页面检测到恢复后会弹窗提示完成。</p>");
   html += F("<div class='info-grid'>");
   appendInfoRow(html, F("固件版本"), String(kMcuFirmwareVersion));
@@ -2747,7 +2761,7 @@ bool runMcuLogin(LanDevice &device, const String &account, const String &passwor
 
   http.addHeader(F("Content-Type"), F("application/json"));
   http.addHeader(F("X-Hermes-Device-Id"), deviceId());
-  http.addHeader(F("X-Hermes-Device-Name"), F("HStudio ESP32-S3"));
+  http.addHeader(F("X-Hermes-Device-Name"), F("HStudio ESP32-C3"));
   int code = http.POST(mcuLoginPayload(account, password, useRemoteLogin ? device.id : String(""), useRemoteLogin));
   String response = http.getString();
   http.end();
@@ -3300,9 +3314,9 @@ bool playPcmStereoStream(WiFiClient *stream, int contentLength, uint32_t sampleR
 
     shapePcmBuffer(buffer, alignedBytes);
     size_t written = 0;
-    int wf_ab = gAudio ? gAudio->Write(reinterpret_cast<int16_t*>(buffer), alignedBytes / 2, 1000) : 0;
-    if (wf_ab <= 0 || static_cast<size_t>(wf_ab) != alignedBytes / 2) {
-      lastAudioDetail = String(F("I2S write failed"));
+    esp_err_t err = i2s_write(kI2sPort, buffer, alignedBytes, &written, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || written != alignedBytes) {
+      lastAudioDetail = String(F("I2S write failed err=")) + String(static_cast<int>(err));
       releaseMcuAudioPrebuffer(&prebuffer);
       audioBusy = false;
       markMcuInteraction(mcuInteractionId, F("failed"), lastAudioDetail);
@@ -3320,9 +3334,9 @@ bool playPcmStereoStream(WiFiClient *stream, int contentLength, uint32_t sampleR
     memset(buffer + pendingBytes, 0, paddedBytes);
     shapePcmBuffer(buffer, kAudioFrameBytes);
     size_t written = 0;
-    int wf = gAudio ? gAudio->Write(reinterpret_cast<int16_t*>(buffer), kAudioFrameBytes / 2, 1000) : 0;
-    if (wf <= 0 || wf * 2 != kAudioFrameBytes) {
-      lastAudioDetail = String(F("I2S final write failed"));
+    esp_err_t err = i2s_write(kI2sPort, buffer, kAudioFrameBytes, &written, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || written != kAudioFrameBytes) {
+      lastAudioDetail = String(F("I2S final write failed err=")) + String(static_cast<int>(err));
       releaseMcuAudioPrebuffer(&prebuffer);
       audioBusy = false;
       markMcuInteraction(mcuInteractionId, F("failed"), lastAudioDetail);
@@ -3433,9 +3447,9 @@ bool playPcmMonoStream(WiFiClient *stream, int contentLength, uint32_t sampleRat
 
     size_t bytesToWrite = outputFrames * 2 * sizeof(int16_t);
     size_t written = 0;
-    int wf = gAudio ? gAudio->Write(reinterpret_cast<int16_t*>(stereo), bytesToWrite / 2, 1000) : 0;
-    if (wf <= 0 || wf * 2 != bytesToWrite) {
-      lastAudioDetail = String(F("I2S mono write failed"));
+    esp_err_t err = i2s_write(kI2sPort, stereo, bytesToWrite, &written, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || written != bytesToWrite) {
+      lastAudioDetail = String(F("I2S mono write failed err=")) + String(static_cast<int>(err));
       releaseMcuAudioPrebuffer(&prebuffer);
       audioBusy = false;
       markMcuInteraction(mcuInteractionId, F("failed"), lastAudioDetail);
@@ -3457,9 +3471,9 @@ bool playPcmMonoStream(WiFiClient *stream, int contentLength, uint32_t sampleRat
     stereo[0] = mono;
     stereo[1] = mono;
     size_t written = 0;
-    int wf_mf = gAudio ? gAudio->Write(reinterpret_cast<int16_t*>(stereo), 2, 1000) : 0;
-    if (wf_mf <= 0 || wf_mf != 2) {
-      lastAudioDetail = String(F("I2S mono final write failed"));
+    esp_err_t err = i2s_write(kI2sPort, stereo, 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || written != 2 * sizeof(int16_t)) {
+      lastAudioDetail = String(F("I2S mono final write failed err=")) + String(static_cast<int>(err));
       releaseMcuAudioPrebuffer(&prebuffer);
       audioBusy = false;
       markMcuInteraction(mcuInteractionId, F("failed"), lastAudioDetail);
@@ -3604,9 +3618,9 @@ bool flushAdpcmStereo(int16_t *stereo, size_t *frames, uint32_t *playedBytes) {
   if (!stereo || !frames || !playedBytes || *frames == 0) return true;
   size_t bytesToWrite = *frames * 2 * sizeof(int16_t);
   size_t written = 0;
-  int wf = gAudio ? gAudio->Write(reinterpret_cast<int16_t*>(stereo), bytesToWrite / 2, 1000) : 0;
-  if (wf <= 0 || wf * 2 != bytesToWrite) {
-    lastAudioDetail = String(F("I2S adpcm write failed"));
+  esp_err_t err = i2s_write(kI2sPort, stereo, bytesToWrite, &written, pdMS_TO_TICKS(1000));
+  if (err != ESP_OK || written != bytesToWrite) {
+    lastAudioDetail = String(F("I2S adpcm write failed err=")) + String(static_cast<int>(err));
     markMcuInteraction(mcuInteractionId, F("failed"), lastAudioDetail);
     return false;
   }
@@ -3812,10 +3826,10 @@ bool playRecordedWav(uint8_t *wav, size_t wavLen) {
 
     size_t bytesToWrite = frames * 2 * sizeof(int16_t);
     size_t written = 0;
-    int wf_rp = gAudio ? gAudio->Write(reinterpret_cast<int16_t*>(stereo), bytesToWrite / 2, 1000) : 0;
-    if (wf_rp <= 0 || wf_rp * 2 != bytesToWrite) {
+    esp_err_t err = i2s_write(kI2sPort, stereo, bytesToWrite, &written, pdMS_TO_TICKS(1000));
+    if (err != ESP_OK || written != bytesToWrite) {
       audioBusy = false;
-      lastAudioDetail = String(F("recorded playback write failed"));
+      lastAudioDetail = String(F("recorded playback write failed err=")) + String(static_cast<int>(err));
       setOledStatus(OledMode::Error, F("PLAY"), F("FAIL"), 0);
       return false;
     }
@@ -4684,6 +4698,7 @@ bool recordAndBroadcastMcuVoiceStream(const String &interactionId) {
   setOledStatus(OledMode::Think, F("LISTEN"), F("SAY NOW"), 0);
 
   constexpr size_t kReadBytes = 512;
+
   uint8_t readBuffer[kReadBytes];
   size_t pcmChunkFrames = 0;
   uint32_t framesDone = 0;
@@ -5382,7 +5397,7 @@ void connectMcuSocketClient() {
   request += port;
   request += F("\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ");
   request += key;
-  request += F("\r\nUser-Agent: HStudio-ESP32S3\r\n\r\n");
+  request += F("\r\nUser-Agent: HStudio-ESP32C3\r\n\r\n");
   mcuWsClient->print(request);
 
   String statusLine = mcuWsClient->readStringUntil('\n');
@@ -5411,7 +5426,7 @@ void connectMcuSocketClient() {
 void sendConnectSuccessPage(const String &ssid, const IPAddress &ip) {
   String target = deviceUrl(ip);
   String html = pageStart(F("Wi-Fi 已连接"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-S3</p><h1>Wi-Fi 已连接</h1>");
+  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>Wi-Fi 已连接</h1>");
   html += F("<p class='lead ok'>");
   html += escapeHtml(ssid);
   html += F(" · IP ");
@@ -5431,7 +5446,7 @@ void sendConnectSuccessPage(const String &ssid, const IPAddress &ip) {
 
 void sendConnectFailedPage(const String &ssid) {
   String html = pageStart(F("Wi-Fi 连接失败"));
-  html += F("<section class='panel'><p class='meta'>HStudio ESP32-S3</p><h1>Wi-Fi 连接失败</h1>");
+  html += F("<section class='panel'><p class='meta'>HStudio ESP32-C3</p><h1>Wi-Fi 连接失败</h1>");
   html += F("<p class='lead bad'>没有连上 ");
   html += escapeHtml(ssid);
   html += F("。请检查 SSID 和密码后重试。</p>");
