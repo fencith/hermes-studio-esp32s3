@@ -2,9 +2,19 @@
 #include "hw_config.h"
 
 #include <Arduino.h>
-#include <SPI.h>
+#include <esp_log.h>
+#include <esp_err.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_vendor.h>
+#include <driver/spi_master.h>
+#include <driver/gpio.h>
+#include <driver/ledc.h>
 #include <cstring>
 #include <algorithm>
+
+#define TAG "ST7789"
+#define LCD_HOST SPI2_HOST
 
 // 5x7 font
 static const uint8_t kFont5x7[96][5] = {
@@ -41,7 +51,9 @@ static const uint8_t kFont5x7[96][5] = {
     {0x44,0x64,0x54,0x4C,0x44},
 };
 
-static SPISettings spiSettings(40000000, MSBFIRST, SPI_MODE3);
+// Forward declare the IDF panel
+static esp_lcd_panel_io_handle_t s_panel_io = nullptr;
+static esp_lcd_panel_handle_t s_panel = nullptr;
 
 St7789Display::St7789Display(int mosi, int sclk, int cs, int dc, int rst, int bl,
                              int width, int height, int offset_x, int offset_y)
@@ -51,27 +63,45 @@ St7789Display::St7789Display(int mosi, int sclk, int cs, int dc, int rst, int bl
 
 St7789Display::~St7789Display() {
     delete[] framebuffer_;
+    if (s_panel) {
+        esp_lcd_panel_del(s_panel);
+        s_panel = nullptr;
+    }
+    if (s_panel_io) {
+        esp_lcd_panel_io_del(s_panel_io);
+        s_panel_io = nullptr;
+    }
 }
 
 bool St7789Display::Init() {
+    ESP_LOGI(TAG, "Initializing ST7789 LCD via ESP-IDF SPI...");
+
     fb_pixels_ = static_cast<size_t>(width_) * height_;
     framebuffer_ = new (std::nothrow) uint16_t[fb_pixels_]();
     if (!framebuffer_) {
-        Serial.println(F("ST7789: framebuffer alloc failed"));
+        ESP_LOGE(TAG, "Framebuffer alloc failed (%zu bytes)", fb_pixels_ * 2);
         return false;
     }
 
-    // Setup control pins
+    // === Step 1: Free GPIO 41 and 42 from any peripheral ===
+    // On ESP32-S3, GPIO 41/42 are USB D-/D+. Explicitly reset them.
+    gpio_reset_pin(static_cast<gpio_num_t>(mosi_));
+    gpio_reset_pin(static_cast<gpio_num_t>(sclk_));
+    gpio_reset_pin(static_cast<gpio_num_t>(cs_));
+    gpio_reset_pin(static_cast<gpio_num_t>(dc_));
+    gpio_reset_pin(static_cast<gpio_num_t>(rst_));
+    gpio_reset_pin(static_cast<gpio_num_t>(bl_));
+    delay(10);
+
+    // === Step 2: Hardware reset ===
     pinMode(rst_, OUTPUT);
     pinMode(dc_, OUTPUT);
     pinMode(cs_, OUTPUT);
     pinMode(bl_, OUTPUT);
-
     digitalWrite(cs_, HIGH);
     digitalWrite(dc_, HIGH);
-    digitalWrite(bl_, LOW);  // BL off during init
+    digitalWrite(bl_, LOW);
 
-    // Hardware reset
     digitalWrite(rst_, HIGH);
     delay(5);
     digitalWrite(rst_, LOW);
@@ -79,104 +109,110 @@ bool St7789Display::Init() {
     digitalWrite(rst_, HIGH);
     delay(150);
 
-    // Init SPI bus - using proper pins
-    SPI.begin(sclk_, -1, mosi_, -1);
+    ESP_LOGI(TAG, "Reset done, initializing SPI bus...");
 
-    // Begin SPI transaction for init sequence
-    SPI.beginTransaction(spiSettings);
-    digitalWrite(cs_, LOW);
+    // === Step 3: Initialize SPI bus using IDF API (same as xiaozhi-esp32) ===
+    spi_bus_config_t buscfg = {};
+    buscfg.mosi_io_num = mosi_;
+    buscfg.miso_io_num = GPIO_NUM_NC;
+    buscfg.sclk_io_num = sclk_;
+    buscfg.quadwp_io_num = GPIO_NUM_NC;
+    buscfg.quadhd_io_num = GPIO_NUM_NC;
+    buscfg.max_transfer_sz = fb_pixels_ * 2;  // Full framebuffer
 
-    // === ST7789 Init Sequence ===
-    WriteCmd(0x01); delay(150);  // SWRESET
-  
-    WriteCmd(0x11); delay(150);  // SLPOUT
+    esp_err_t ret = spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI bus init failed: %d", ret);
+        return false;
+    }
+    ESP_LOGI(TAG, "SPI bus initialized on host %d (MOSI=%d, SCLK=%d)", LCD_HOST, mosi_, sclk_);
 
-    WriteCmd(0x36);              // MADCTL
-    WriteData(0x00);
+    // === Step 4: Attach LCD panel IO ===
+    esp_lcd_panel_io_spi_config_t io_config = {};
+    io_config.cs_gpio_num = cs_;
+    io_config.dc_gpio_num = dc_;
+    io_config.spi_mode = 3;
+    io_config.pclk_hz = 80 * 1000 * 1000;  // 80MHz
+    io_config.trans_queue_depth = 10;
+    io_config.lcd_cmd_bits = 8;
+    io_config.lcd_param_bits = 8;
 
-    WriteCmd(0x3A);              // COLMOD
-    WriteData(0x55);             // 16-bit color (RGB565)
+    ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config, &s_panel_io);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Panel IO init failed: %d", ret);
+        spi_bus_free(LCD_HOST);
+        return false;
+    }
+    ESP_LOGI(TAG, "Panel IO created on CS=%d DC=%d", cs_, dc_);
 
-    WriteCmd(0xB2);              // PORCTRK
-    WriteData(0x0C);
-    WriteData(0x0C);
-    WriteData(0x00);
-    WriteData(0x33);
-    WriteData(0x33);
+    // === Step 5: Create ST7789 panel (using Espressif vendor driver) ===
+    esp_lcd_panel_dev_config_t panel_config = {};
+    panel_config.reset_gpio_num = rst_;
+    panel_config.color_space = ESP_LCD_COLOR_SPACE_RGB;
+    panel_config.bits_per_pixel = 16;
 
-    WriteCmd(0xB7);              // GCTRL
-    WriteData(0x75);
+    ret = esp_lcd_new_panel_st7789(s_panel_io, &panel_config, &s_panel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Panel creation failed: %d", ret);
+        esp_lcd_panel_io_del(s_panel_io);
+        s_panel_io = nullptr;
+        spi_bus_free(LCD_HOST);
+        return false;
+    }
 
-    WriteCmd(0xBB);              // VCOMS
-    WriteData(0x28);
+    // === Step 6: Init panel ===
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, false, false));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    WriteCmd(0xC0);              // LCMCTRL
-    WriteData(0x2C);
+    ESP_LOGI(TAG, "Panel init done");
 
-    WriteCmd(0xC2);              // VDVVRHEN
-    WriteData(0x01);
+    // === Step 7: Backlight via LEDC PWM ===
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = bl_,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 255,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ESP_LOGI(TAG, "Backlight ON (GPIO %d)", bl_);
 
-    WriteCmd(0xC3);              // VRHS
-    WriteData(0x1A);
-
-    WriteCmd(0xC4);              // VDVS
-    WriteData(0x1A);
-
-    WriteCmd(0xC6);              // FRCTRL2
-    WriteData(0x01);
-
-    WriteCmd(0xD0);              // PWCTRL1
-    WriteData(0xA4);
-    WriteData(0xA1);
-
-    WriteCmd(0xE0);              // PVGAMCTRL
-    WriteData(0xD0); WriteData(0x04); WriteData(0x0D);
-    WriteData(0x11); WriteData(0x13); WriteData(0x2B);
-    WriteData(0x3F); WriteData(0x54); WriteData(0x4C);
-    WriteData(0x18); WriteData(0x0D); WriteData(0x0B);
-    WriteData(0x1F); WriteData(0x23);
-
-    WriteCmd(0xE1);              // NVGAMCTRL
-    WriteData(0xD0); WriteData(0x04); WriteData(0x0C);
-    WriteData(0x11); WriteData(0x13); WriteData(0x2C);
-    WriteData(0x3F); WriteData(0x44); WriteData(0x51);
-    WriteData(0x2F); WriteData(0x1F); WriteData(0x1F);
-    WriteData(0x20); WriteData(0x23);
-
-    WriteCmd(0x21);              // INVON
-    WriteCmd(0x29);              // DISPON
-
-    digitalWrite(cs_, HIGH);
-    SPI.endTransaction();
-
-    delay(120);
-
-    // Backlight ON
-    digitalWrite(bl_, HIGH);
-    delay(50);
-
-    // Clear screen to black
+    // === Step 8: Clear and show test pattern ===
     Clear(0x0000);
     Flush();
+    delay(50);
 
-    Serial.println(F("ST7789 init OK (240x240, 40MHz SPI)"));
+    // Draw a test pattern to confirm display works
+    FillRect(0, 0, width_, 30, 0xF800);   // Red bar top
+    FillRect(0, height_-30, width_, 30, 0x001F);  // Blue bar bottom
+    DrawCenteredText(height_/2 - 10, "Hello!", 0xFFFF, 0x0000, 2);
+    Flush();
+
+    ESP_LOGI(TAG, "ST7789 LCD ready!");
     return true;
 }
 
 void St7789Display::SetBrightness(uint8_t percent) {
-    if (percent >= 100) {
-        digitalWrite(bl_, HIGH);
-    } else if (percent == 0) {
-        digitalWrite(bl_, LOW);
-    } else {
-        analogWrite(bl_, (percent * 255) / 100);
-    }
+    uint32_t duty = (static_cast<uint32_t>(percent) * 255) / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
 void St7789Display::Clear(uint16_t color) {
-    for (size_t i = 0; i < fb_pixels_; i++) {
-        framebuffer_[i] = color;
-    }
+    for (size_t i = 0; i < fb_pixels_; i++) framebuffer_[i] = color;
 }
 
 void St7789Display::SetPixel(int x, int y, uint16_t color) {
@@ -196,19 +232,9 @@ void St7789Display::FillRect(int x, int y, int w, int h, uint16_t color) {
 }
 
 void St7789Display::Flush() {
-    SPI.beginTransaction(spiSettings);
-    digitalWrite(cs_, LOW);
-    WriteCmd(0x2A);  // CASET
-    WriteData(0x00); WriteData(0x00);
-    WriteData(((width_ - 1) >> 8) & 0xFF); WriteData((width_ - 1) & 0xFF);
-    WriteCmd(0x2B);  // RASET
-    WriteData(0x00); WriteData(0x00);
-    WriteData(((height_ - 1) >> 8) & 0xFF); WriteData((height_ - 1) & 0xFF);
-    WriteCmd(0x2C);  // RAMWR
-    digitalWrite(dc_, HIGH);
-    SPI.writeBytes(reinterpret_cast<uint8_t*>(framebuffer_), fb_pixels_ * 2);
-    digitalWrite(cs_, HIGH);
-    SPI.endTransaction();
+    if (!s_panel) return;
+    esp_lcd_panel_draw_bitmap(s_panel, 0, 0, width_, height_,
+                              reinterpret_cast<uint8_t*>(framebuffer_));
 }
 
 void St7789Display::DrawChar(int x, int y, char c, uint16_t fg, uint16_t bg, uint8_t scale) {
@@ -276,11 +302,8 @@ void St7789Display::DrawRect(int x, int y, int w, int h, uint16_t color) {
 
 void St7789Display::DrawRoundRect(int x, int y, int w, int h, int r, uint16_t color, bool fill) {
     r = std::max(0, std::min(r, std::min(w, h) / 2));
-    if (fill) {
-        FillRect(x, y, w, h, color);
-    } else {
-        DrawRect(x, y, w, h, color);
-    }
+    if (fill) FillRect(x, y, w, h, color);
+    else DrawRect(x, y, w, h, color);
 }
 
 void St7789Display::DrawEye(int cx, int cy, int size, bool blink, bool thinking, bool error, uint16_t color) {
@@ -298,35 +321,4 @@ void St7789Display::DrawEye(int cx, int cy, int size, bool blink, bool thinking,
     }
     int eyeH = thinking ? size * 3 / 4 : size;
     DrawRoundRect(cx - size / 2, cy - eyeH / 2, size, eyeH, size / 4, color);
-}
-
-// --- LOW LEVEL (transaction must be active) ---
-
-void St7789Display::WriteCmd(uint8_t cmd) {
-    digitalWrite(dc_, LOW);
-    SPI.write(cmd);
-}
-
-void St7789Display::WriteData(uint8_t data) {
-    digitalWrite(dc_, HIGH);
-    SPI.write(data);
-}
-
-void St7789Display::WriteData16(uint16_t data) {
-    digitalWrite(dc_, HIGH);
-    SPI.write16(data);
-}
-
-void St7789Display::WriteBuf(const uint8_t* buf, size_t len) {
-    digitalWrite(dc_, HIGH);
-    SPI.writeBytes(buf, len);
-}
-
-void St7789Display::SetWindow(int x0, int y0, int x1, int y1) {
-    WriteCmd(0x2A);  // CASET
-    WriteData(0x00); WriteData(x0 & 0xFF);
-    WriteData(0x00); WriteData(x1 & 0xFF);
-    WriteCmd(0x2B);  // RASET
-    WriteData(0x00); WriteData(y0 & 0xFF);
-    WriteData(0x00); WriteData(y1 & 0xFF);
 }

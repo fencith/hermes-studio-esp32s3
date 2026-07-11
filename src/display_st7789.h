@@ -12,7 +12,6 @@ public:
     bool Init();
     void SetBrightness(uint8_t percent);
     void Clear(uint16_t color = 0x0000);
-
     void SetPixel(int x, int y, uint16_t color);
     void FillRect(int x, int y, int w, int h, uint16_t color);
     void Flush();
@@ -22,7 +21,6 @@ public:
     void DrawCenteredText(int y, const char* text, uint16_t fg, uint16_t bg, uint8_t scale = 1);
     void DrawScrollingText(int y, const char* text, uint16_t fg, uint16_t bg, uint8_t scale = 1);
     int TextWidth(const char* text, uint8_t scale = 1);
-
     void DrawHLine(int x, int y, int w, uint16_t color);
     void DrawVLine(int x, int y, int h, uint16_t color);
     void DrawRect(int x, int y, int w, int h, uint16_t color);
@@ -33,13 +31,6 @@ public:
     int height() const { return height_; }
 
 private:
-    void WriteCmd(uint8_t cmd);
-    void WriteData(uint8_t data);
-    void WriteData16(uint16_t data);
-    void WriteBuf(const uint8_t* buf, size_t len);
-    void SetWindow(int x0, int y0, int x1, int y1);
-    void UpdateScroll();
-
     int mosi_, sclk_, cs_, dc_, rst_, bl_;
     int width_, height_, offset_x_, offset_y_;
     uint16_t* framebuffer_;
