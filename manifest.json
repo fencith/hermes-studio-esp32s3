@@ -1,0 +1,46 @@
+{
+  "name": "HStudio ESP32-S3 Hermes Relay Firmware v1",
+  "firmwareVersion": "v1",
+  "version": "v1-esp32-s3-hermes-relay",
+  "buildDate": "2026-07-10",
+  "chip": "esp32s3",
+  "flashSize": "16MB",
+  "flashMode": "qio",
+  "flashFrequency": "80m",
+  "psram": "8MB octal 80MHz",
+  "hardware": {
+    "board": "ESP32-S3 with I2C OLED + I2S ES8311 audio",
+    "i2c": {
+      "sda": 0,
+      "scl": 1
+    },
+    "i2s": {
+      "mck": 8,
+      "bck": 7,
+      "ws": 5,
+      "dout": 4,
+      "din": 6
+    },
+    "oledAddress": "0x3C"
+  },
+  "features": [
+    "Wi-Fi setup portal",
+    "Open HStudio-WIFI setup access point",
+    "Pre-AP Wi-Fi network scan dropdown",
+    "Manual Wi-Fi SSID fallback",
+    "Provisioning success page with LAN IP redirect",
+    "Saved Wi-Fi reconnect",
+    "Wi-Fi history scan before startup reconnect",
+    "LAN device tab with fixed-port UDP Hermes discovery",
+    "MCU login form for discovered endpoints",
+    "Profile selection after MCU login",
+    "Socket.IO client connection to Hermes Web UI /global-agent",
+    "ESP32-S3 PSRAM support for larger audio buffers",
+    "IMA-ADPCM voice uplink",
+    "VAD voice activity detection",
+    "Remote active machine reauthentication",
+    "OLED status UI and idle animation",
+    "OTA firmware update",
+    "Battery monitoring"
+  ]
+}
