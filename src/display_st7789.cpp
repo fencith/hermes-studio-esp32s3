@@ -1,13 +1,12 @@
 #include "display_st7789.h"
+#include "hw_config.h"
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <cstring>
 #include <algorithm>
 
-#define TAG "ST7789"
-
-// 5x7 font (same as original)
+// 5x7 font
 static const uint8_t kFont5x7[96][5] = {
     {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
     {0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
@@ -42,7 +41,7 @@ static const uint8_t kFont5x7[96][5] = {
     {0x44,0x64,0x54,0x4C,0x44},
 };
 
-static SPISettings spiSettings(80000000, MSBFIRST, SPI_MODE3);
+static SPISettings spiSettings(40000000, MSBFIRST, SPI_MODE3);
 
 St7789Display::St7789Display(int mosi, int sclk, int cs, int dc, int rst, int bl,
                              int width, int height, int offset_x, int offset_y)
@@ -56,39 +55,47 @@ St7789Display::~St7789Display() {
 
 bool St7789Display::Init() {
     fb_pixels_ = static_cast<size_t>(width_) * height_;
-    framebuffer_ = new uint16_t[fb_pixels_]();
-    if (!framebuffer_) return false;
+    framebuffer_ = new (std::nothrow) uint16_t[fb_pixels_]();
+    if (!framebuffer_) {
+        Serial.println(F("ST7789: framebuffer alloc failed"));
+        return false;
+    }
 
-    // Setup GPIO
+    // Setup control pins
     pinMode(rst_, OUTPUT);
     pinMode(dc_, OUTPUT);
     pinMode(cs_, OUTPUT);
     pinMode(bl_, OUTPUT);
-    digitalWrite(cs_, HIGH);
 
-    // Reset sequence
+    digitalWrite(cs_, HIGH);
+    digitalWrite(dc_, HIGH);
+    digitalWrite(bl_, LOW);  // BL off during init
+
+    // Hardware reset
     digitalWrite(rst_, HIGH);
-    delay(10);
+    delay(5);
     digitalWrite(rst_, LOW);
     delay(10);
     digitalWrite(rst_, HIGH);
-    delay(120);
+    delay(150);
 
-    // Init SPI
-    SPI.begin(sclk_, -1, mosi_, -1);  // SCLK, MISO, MOSI, SS
+    // Init SPI bus - using proper pins
+    SPI.begin(sclk_, -1, mosi_, -1);
 
-    // Backlight on
-    digitalWrite(bl_, HIGH);
+    // Begin SPI transaction for init sequence
+    SPI.beginTransaction(spiSettings);
+    digitalWrite(cs_, LOW);
 
-    // ST7789 init sequence
+    // === ST7789 Init Sequence ===
     WriteCmd(0x01); delay(150);  // SWRESET
+  
     WriteCmd(0x11); delay(150);  // SLPOUT
 
     WriteCmd(0x36);              // MADCTL
-    WriteData(0x00);             // Normal orientation
+    WriteData(0x00);
 
     WriteCmd(0x3A);              // COLMOD
-    WriteData(0x05);             // 16-bit color (RGB565)
+    WriteData(0x55);             // 16-bit color (RGB565)
 
     WriteCmd(0xB2);              // PORCTRK
     WriteData(0x0C);
@@ -116,59 +123,60 @@ bool St7789Display::Init() {
     WriteData(0x1A);
 
     WriteCmd(0xC6);              // FRCTRL2
-    WriteData(0x01);             // 60Hz
+    WriteData(0x01);
 
     WriteCmd(0xD0);              // PWCTRL1
     WriteData(0xA4);
     WriteData(0xA1);
 
     WriteCmd(0xE0);              // PVGAMCTRL
-    WriteData(0xD0);
-    WriteData(0x04);
-    WriteData(0x0D);
-    WriteData(0x11);
-    WriteData(0x13);
-    WriteData(0x2B);
-    WriteData(0x3F);
-    WriteData(0x54);
-    WriteData(0x4C);
-    WriteData(0x18);
-    WriteData(0x0D);
-    WriteData(0x0B);
-    WriteData(0x1F);
-    WriteData(0x23);
+    WriteData(0xD0); WriteData(0x04); WriteData(0x0D);
+    WriteData(0x11); WriteData(0x13); WriteData(0x2B);
+    WriteData(0x3F); WriteData(0x54); WriteData(0x4C);
+    WriteData(0x18); WriteData(0x0D); WriteData(0x0B);
+    WriteData(0x1F); WriteData(0x23);
 
     WriteCmd(0xE1);              // NVGAMCTRL
-    WriteData(0xD0);
-    WriteData(0x04);
-    WriteData(0x0C);
-    WriteData(0x11);
-    WriteData(0x13);
-    WriteData(0x2C);
-    WriteData(0x3F);
-    WriteData(0x44);
-    WriteData(0x51);
-    WriteData(0x2F);
-    WriteData(0x1F);
-    WriteData(0x1F);
-    WriteData(0x20);
-    WriteData(0x23);
+    WriteData(0xD0); WriteData(0x04); WriteData(0x0C);
+    WriteData(0x11); WriteData(0x13); WriteData(0x2C);
+    WriteData(0x3F); WriteData(0x44); WriteData(0x51);
+    WriteData(0x2F); WriteData(0x1F); WriteData(0x1F);
+    WriteData(0x20); WriteData(0x23);
 
-    WriteCmd(0x21);              // INVON (color inversion)
-
+    WriteCmd(0x21);              // INVON
     WriteCmd(0x29);              // DISPON
-    delay(100);
 
+    digitalWrite(cs_, HIGH);
+    SPI.endTransaction();
+
+    delay(120);
+
+    // Backlight ON
+    digitalWrite(bl_, HIGH);
+    delay(50);
+
+    // Clear screen to black
     Clear(0x0000);
+    Flush();
+
+    Serial.println(F("ST7789 init OK (240x240, 40MHz SPI)"));
     return true;
 }
 
 void St7789Display::SetBrightness(uint8_t percent) {
-    analogWrite(bl_, (percent * 255) / 100);
+    if (percent >= 100) {
+        digitalWrite(bl_, HIGH);
+    } else if (percent == 0) {
+        digitalWrite(bl_, LOW);
+    } else {
+        analogWrite(bl_, (percent * 255) / 100);
+    }
 }
 
 void St7789Display::Clear(uint16_t color) {
-    for (size_t i = 0; i < fb_pixels_; i++) framebuffer_[i] = color;
+    for (size_t i = 0; i < fb_pixels_; i++) {
+        framebuffer_[i] = color;
+    }
 }
 
 void St7789Display::SetPixel(int x, int y, uint16_t color) {
@@ -180,8 +188,9 @@ void St7789Display::FillRect(int x, int y, int w, int h, uint16_t color) {
     int x0 = std::max(0, x), y0 = std::max(0, y);
     int x1 = std::min(width_, x + w), y1 = std::min(height_, y + h);
     for (int yy = y0; yy < y1; yy++) {
+        int row = yy * width_;
         for (int xx = x0; xx < x1; xx++) {
-            framebuffer_[yy * width_ + xx] = color;
+            framebuffer_[row + xx] = color;
         }
     }
 }
@@ -191,10 +200,10 @@ void St7789Display::Flush() {
     digitalWrite(cs_, LOW);
     WriteCmd(0x2A);  // CASET
     WriteData(0x00); WriteData(0x00);
-    WriteData(0x00); WriteData((width_ - 1) & 0xFF);
+    WriteData(((width_ - 1) >> 8) & 0xFF); WriteData((width_ - 1) & 0xFF);
     WriteCmd(0x2B);  // RASET
     WriteData(0x00); WriteData(0x00);
-    WriteData(0x00); WriteData((height_ - 1) & 0xFF);
+    WriteData(((height_ - 1) >> 8) & 0xFF); WriteData((height_ - 1) & 0xFF);
     WriteCmd(0x2C);  // RAMWR
     digitalWrite(dc_, HIGH);
     SPI.writeBytes(reinterpret_cast<uint8_t*>(framebuffer_), fb_pixels_ * 2);
@@ -255,7 +264,7 @@ void St7789Display::DrawHLine(int x, int y, int w, uint16_t color) {
 }
 
 void St7789Display::DrawVLine(int x, int y, int h, uint16_t color) {
-    FillRect(x, 1, 1, h, color);
+    FillRect(x, y, 1, h, color);
 }
 
 void St7789Display::DrawRect(int x, int y, int w, int h, uint16_t color) {
@@ -291,34 +300,26 @@ void St7789Display::DrawEye(int cx, int cy, int size, bool blink, bool thinking,
     DrawRoundRect(cx - size / 2, cy - eyeH / 2, size, eyeH, size / 4, color);
 }
 
-// --- LOW LEVEL ---
+// --- LOW LEVEL (transaction must be active) ---
 
 void St7789Display::WriteCmd(uint8_t cmd) {
     digitalWrite(dc_, LOW);
-    digitalWrite(cs_, LOW);
     SPI.write(cmd);
-    digitalWrite(cs_, HIGH);
 }
 
 void St7789Display::WriteData(uint8_t data) {
     digitalWrite(dc_, HIGH);
-    digitalWrite(cs_, LOW);
     SPI.write(data);
-    digitalWrite(cs_, HIGH);
 }
 
 void St7789Display::WriteData16(uint16_t data) {
     digitalWrite(dc_, HIGH);
-    digitalWrite(cs_, LOW);
     SPI.write16(data);
-    digitalWrite(cs_, HIGH);
 }
 
 void St7789Display::WriteBuf(const uint8_t* buf, size_t len) {
     digitalWrite(dc_, HIGH);
-    digitalWrite(cs_, LOW);
     SPI.writeBytes(buf, len);
-    digitalWrite(cs_, HIGH);
 }
 
 void St7789Display::SetWindow(int x0, int y0, int x1, int y1) {
@@ -328,8 +329,4 @@ void St7789Display::SetWindow(int x0, int y0, int x1, int y1) {
     WriteCmd(0x2B);  // RASET
     WriteData(0x00); WriteData(y0 & 0xFF);
     WriteData(0x00); WriteData(y1 & 0xFF);
-}
-
-void St7789Display::UpdateScroll() {
-    // Scrolling update called from DrawScrollingText
 }

@@ -669,9 +669,6 @@ void refreshOled(bool force = false) {
     } else if (oledMode == OledMode::Think) {
       gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, true, false, 0xFFFF);
       gDisplay->DrawCenteredText(gDisplay->height() - 16, oledHint.c_str(), 0x7BEF, 0x0000, 1);
-    } else if (oledMode == OledMode::Ready) {
-      gDisplay->DrawCenteredText(gDisplay->height() / 2 - 4, oledTitle.c_str(), 0xFFFF, 0x0000, 2);
-      gDisplay->DrawCenteredText(gDisplay->height() / 2 + 12, oledHint.c_str(), 0x07E0, 0x0000, 1);
     } else if (oledMode == OledMode::Error) {
       gDisplay->DrawEye(gDisplay->width() / 2, gDisplay->height() / 2, 20, false, false, true, 0xF800);
       gDisplay->DrawCenteredText(gDisplay->height() - 16, oledHint.c_str(), 0xF800, 0x0000, 1);
@@ -729,6 +726,25 @@ void tickOledStatusReturn() {
 }
 
 void initOledDisplay() {
+  // === Try ST7789 SPI LCD first ===
+  gDisplay = new St7789Display(41, 42, 21, 40, 45, 20, 240, 240, 0, 0);
+  if (gDisplay->Init()) {
+    oledReady = true;
+    oledFound = true;
+    Serial.println(F("ST7789 LCD ready - 240x240 RGB565"));
+    gDisplay->Clear(0x0000);
+    gDisplay->DrawCenteredText(100, "Hermes Studio", 0xFFFF, 0x0000, 2);
+    gDisplay->DrawCenteredText(130, "ESP32-S3", 0x7BEF, 0x0000, 2);
+    gDisplay->Flush();
+    setOledStatus(OledMode::Boot, F("BOOT"), F("LCD ONLINE"), 10);
+    return;
+  }
+  // ST7789 failed - cleanup
+  Serial.println(F("ST7789 init FAILED, deleting gDisplay"));
+  delete gDisplay;
+  gDisplay = nullptr;
+
+  // === Fallback: I2C OLED (C3 boards) ===
   Wire.begin(kPinI2cSda, kPinI2cScl);
   Wire.setClock(100000);
   delay(40);
